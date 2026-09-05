@@ -97,6 +97,7 @@ type whatsmeowService struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	passkeyCeremony    *ceremony.Store
+	sharedDeviceStore  *deviceStoreHolder
 }
 
 type MyClient struct {
@@ -301,12 +302,67 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// deviceStoreHolder memoizes the whatsmeow device-store container for the whole
+// process. It is held behind a pointer because whatsmeowService is used through
+// value receivers: a field assigned on the copy would be thrown away, and the
+// container would be rebuilt on every call — which is exactly the bug this fixes.
+type deviceStoreHolder struct {
+	once      sync.Once
+	container *sqlstore.Container
+	err       error
+}
+
+// deviceContainer returns the shared whatsmeow device store, building it once.
+//
+// It used to be built inline in StartClient, which called sqlstore.New on every
+// connect and reconnect. sqlstore.New runs its own sql.Open, so each call created
+// a *new* database/sql pool with Go's default of unlimited open connections, and
+// nothing ever called Container.Close. In production that leaked roughly two
+// Postgres connections per reconnect until it hit max_connections (measured: 99
+// idle connections on evogo_auth against a limit of 100, accumulated over a week).
+// Past that point no container could be created at all, so no instance could ever
+// reach WhatsApp and every /send/* answered 500 after a 48s stall.
+//
+// The container is a device store keyed by JID and is designed to be shared across
+// instances, so one per process is both correct and sufficient. On Postgres it now
+// reuses w.authDB — the pool initPostgresAuthDB already bounds at 25 open / 5 idle
+// connections — via sqlstore.NewWithDB. That skips sqlstore.New's internal
+// sql.Open entirely, which is the only reason the leak existed; NewWithDB does not
+// run migrations, so Upgrade is called explicitly here.
+func (w whatsmeowService) deviceContainer() (*sqlstore.Container, error) {
+	w.sharedDeviceStore.once.Do(func() {
+		var dbLog waLog.Logger
+		if w.config.WaDebug != "" {
+			dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+		}
+
+		if w.config.PostgresAuthDB != "" && w.authDB != nil {
+			container := sqlstore.NewWithDB(w.authDB, "postgres", dbLog)
+			if err := container.Upgrade(context.Background()); err != nil {
+				w.sharedDeviceStore.err = fmt.Errorf("failed to upgrade whatsmeow schema: %w", err)
+				return
+			}
+			w.sharedDeviceStore.container = container
+			return
+		}
+
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		container, err := sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+		if err != nil {
+			w.sharedDeviceStore.err = err
+			return
+		}
+		w.sharedDeviceStore.container = container
+	})
+
+	return w.sharedDeviceStore.container, w.sharedDeviceStore.err
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
 
 	var deviceStore *store.Device
-	var err error
 
 	if w.clientPointer[cd.Instance.Id] != nil {
 		if w.clientPointer[cd.Instance.Id].IsConnected() {
@@ -314,24 +370,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
+	// Shared and built once — see deviceContainer. Rebuilding it here leaked a
+	// Postgres pool per reconnect until the server ran out of connections.
+	container, err := w.deviceContainer()
 
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
@@ -2831,6 +2872,7 @@ func NewWhatsmeowService(
 		natsProducer:       natsProducer,
 		loggerWrapper:      loggerWrapper,
 		passkeyCeremony:    ceremony.NewStore(),
+		sharedDeviceStore:  &deviceStoreHolder{},
 	}
 }
 
